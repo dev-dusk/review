@@ -1,0 +1,43 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: hmdp
+  datasource:
+    driver-class-name: com.mysql.jdbc.Driver
+    url: jdbc:mysql://120.27.236.84:3306/hmdp?useSSL=false&serverTimezone=UTC
+    username: root
+    password: M]nf])rMtF>ET6R)[XJbv#?:{;;]hM#a
+  redis:
+    host: 120.27.236.84
+    port: 6379
+    password: 1qazXSW@
+    lettuce:
+      pool:
+        max-active: 10
+        max-idle: 10
+        min-idle: 1
+        time-between-eviction-runs: 10s
+  jackson:
+    default-property-inclusion: non_null # JSON处理时忽略非空字段
+  devtools:
+    restart:
+      # 启用热部署，默认已启用
+      enabled: true
+      # 排除某些文件变化时不重启，例如静态资源
+      exclude: "static/**,templates/**,application.properties"
+      # 设置监控的额外目录，默认监控 src/main/java 和 src/main/resources
+      additional-paths: "src/main/resources"
+    livereload:
+      # 启用 LiveReload，浏览器自动刷新，需要浏览器插件支持
+      enabled: true
+    remote:
+      debug:
+        # 远程调试配置，可选
+        enabled: true
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity # 别名扫描包
+logging:
+  level:
+    com.hmdp: debug
+
