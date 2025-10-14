@@ -5,3 +5,7 @@ http://127.0.0.1:8080/
 start E:\JAVA\redis_dianping\nginx-1.18.0\nginx.exe
 
 stop E:\JAVA\redis_dianping\nginx-1.18.0\nginx.exe
+
+
+
+13912345678
