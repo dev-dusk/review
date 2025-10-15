@@ -29,8 +29,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import static com.hmdp.utils.RedisConstants.BLOOM_FILTER_SHOP_KEY;
-import static com.hmdp.utils.RedisConstants.CACHE_NULL_TTL;
+import static com.hmdp.utils.RedisConstants.*;
 
 /**
  * <p>
@@ -47,9 +46,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     private final StringRedisTemplate stringRedisTemplate;
     private final RedissonClient redissonClient;
+    private final TryLockUtil tryLockUtil;
     // 布隆过滤器
     private RBloomFilter<Long> shopBloomFilter;
-    private TryLockUtil tryLockUtil;
 
 
     /**
@@ -104,9 +103,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             return Result.fail("商品不存在");
         }
         return queryWithMutex(id);
+//        return queryWithExpire(id);
     }
 
-    // 缓存穿透：互斥锁解决
+    // 缓存击穿：互斥锁解决
     private Result queryWithMutex(Long id) {
         String shopKey = RedisConstants.CACHE_SHOP_KEY + id;
         String shopInfo = stringRedisTemplate.opsForValue().get(shopKey);
@@ -135,7 +135,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                         stringRedisTemplate.opsForValue().set(shopKey, RedisConstants.CACHE_NULL_KEY,
                                 CACHE_NULL_TTL, TimeUnit.MINUTES);
                     } else {
-                        stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(shop), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+                        stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
                     }
                     return Result.ok(shop);
                 } finally {
@@ -146,52 +146,62 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return Result.fail("系统繁忙，请稍后再试！");
     }
 
-    // 缓存穿透：逻辑过期
+    // 缓存击穿：逻辑过期
     private Result queryWithExpire(Long id) {
         String shopKey = RedisConstants.CACHE_SHOP_KEY + id;
         String shopInfo = stringRedisTemplate.opsForValue().get(shopKey);
-        RedisData<Shop> shop = JSONUtil.toBean(shopInfo, new TypeReference<RedisData<Shop>>() {}, true);
-        LocalDateTime expireTime = shop.getExpireTime();
-        if (expireTime.isAfter(LocalDateTime.now())) {
-            log.info("商品缓存命中且逻辑未过期：{}", shopInfo);
-            return Result.ok(shop.getData());
+        // 1.如果缓存未存在，查询数据库并设置逻辑过期时间
+        if (!StringUtils.hasText(shopInfo)) {
+            Shop shopById = getById(id);
+            if (Objects.isNull(shopById)) {
+                RedisData<Shop> nullData = new RedisData<>();
+                nullData.setData(null);
+                nullData.setExpireTime(LocalDateTime.now().plusMinutes(CACHE_NULL_TTL));
+                stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(nullData));
+                return Result.fail("商品不存在！");
+            }
+            RedisData<Shop> shopRedisData = new RedisData<>();
+            shopRedisData.setData(shopById);
+            shopRedisData.setExpireTime(LocalDateTime.now().plusMinutes(CACHE_SHOP_TTL));
+            stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(shopRedisData));
+            return Result.ok(shopById);
         }
-        // 获取锁并更新缓存
-        log.warn("未命中商品{}缓存", id);
+
+        //2.命中缓存，并且未逻辑过期
+        RedisData<Shop> shopData = JSONUtil.toBean(shopInfo, new TypeReference<RedisData<Shop>>() {
+        }, true);
+        if (shopData.getExpireTime().isAfter(LocalDateTime.now())) {
+            log.info("缓存未逻辑过期:{}", shopData);
+            return Result.ok(shopData.getData());
+        }
+
+        // 3.逻辑已过期，先返回旧数据，再去异步更新
         String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
-        int retries = 3;
-        while (retries-- > 0) {
-            if (tryLockUtil.tryLock(lockKey)) {
+        if (tryLockUtil.tryLock(lockKey)) {
+            CompletableFuture.runAsync(() -> {
+                // 双检机制
                 try {
-                    // 双检机制
-                    shopInfo = stringRedisTemplate.opsForValue().get(shopKey);
-                    shop = JSONUtil.toBean(shopInfo, new TypeReference<RedisData<Shop>>() {}, true);
-                    expireTime = shop.getExpireTime();
+                    String newShopInfo = stringRedisTemplate.opsForValue().get(shopKey);
+                    RedisData<Shop> newShop = JSONUtil.toBean(newShopInfo, new TypeReference<RedisData<Shop>>() {}, true);
+                    LocalDateTime expireTime = newShop.getExpireTime();
                     if (expireTime.isAfter(LocalDateTime.now())) {
-                        log.info("商品缓存命中且逻辑未过期且已重试：{}", shopInfo);
-                        return Result.ok(shop.getData());
+                        log.info("已由其他线程更新缓存：{}", shopInfo);
+                        return;
                     }
-                    Shop shopById = getById(id);
-                    // 防止缓存击穿方案1：采用缓存空对象
-                    if (Objects.isNull(shopById)) {
-                        RedisData<Shop> nullData = new RedisData<>();
-                        nullData.setData(null);
-                        nullData.setExpireTime(LocalDateTime.now().plusMinutes(CACHE_NULL_TTL));
-                        stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(nullData),
-                                CACHE_NULL_TTL, TimeUnit.MINUTES);
-                    } else {
-                        RedisData<Shop> shopRedisData = new RedisData<>();
-                        shopRedisData.setData(shopById);
-                        shopRedisData.setExpireTime(LocalDateTime.now().plusMinutes(20L));
-                        stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(shopRedisData), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
-                    }
-                    return Result.ok(shopById);
+                    Shop newShopData = getById(id);
+                    RedisData<Shop> newShopRedisData = new RedisData<>();
+                    newShopRedisData.setData(newShopData);
+                    newShopRedisData.setExpireTime(LocalDateTime.now().plusMinutes(CACHE_SHOP_TTL));
+                    stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(newShopRedisData));
+                    log.info("异步更新缓存成功，商品:{}", newShopData);
                 } finally {
                     tryLockUtil.unLock(lockKey);
                 }
-            }
+            });
         }
-        return Result.fail("系统繁忙，请稍后再试！");
+
+        log.info("返回旧数据，商品：{}", shopData);
+        return Result.ok(shopData.getData());
     }
 
 
