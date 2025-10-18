@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd" >
+<mapper namespace="com.hmdp.mapper.VoucherOrderMapper">
+    <update id="recoverStock">
+        update tb_seckill_voucher
+        set stock = 100
+        where voucher_id = 10
+    </update>
+
+
+    <delete id="recoverOrder">
+        delete
+        from tb_voucher_order
+    </delete>
+</mapper>
