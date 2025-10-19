@@ -9,16 +9,21 @@ import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
+import com.hmdp.utils.VoucherUtil;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.springframework.aop.framework.AopContext;
-import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.annotation.PostConstruct;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
@@ -32,33 +37,41 @@ import java.util.concurrent.TimeUnit;
  */
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
     private final VoucherOrderMapper voucherOrderMapper;
     private final ISeckillVoucherService seckillVoucherService;
     private final RedisIdWorker redisIdWorker;
     private final StringRedisTemplate stringRedisTemplate;
-    private final RedissonClient redissonClient1;
-    private final RedissonClient redissonClient2;
-    private final RedissonClient redissonClient3;
+    private final RedissonClient redissonClient;
     private static final String LOCK_KEY = "lock:shop:";
-
-    public VoucherOrderServiceImpl(
-            VoucherOrderMapper voucherOrderMapper,
-            ISeckillVoucherService seckillVoucherService,
-            RedisIdWorker redisIdWorker,
-            StringRedisTemplate stringRedisTemplate,
-            @Qualifier("redissonClient1") RedissonClient redissonClient1,
-            @Qualifier("redissonClient2") RedissonClient redissonClient2,
-            @Qualifier("redissonClient3") RedissonClient redissonClient3) {
-        this.voucherOrderMapper = voucherOrderMapper;
-        this.seckillVoucherService = seckillVoucherService;
-        this.redisIdWorker = redisIdWorker;
-        this.stringRedisTemplate = stringRedisTemplate;
-        this.redissonClient1 = redissonClient1;
-        this.redissonClient2 = redissonClient2;
-        this.redissonClient3 = redissonClient3;
+    private static final String PREHEAT_KEY = "seckill:stock:";
+    private final VoucherUtil voucherUtil;
+    private static DefaultRedisScript<Long> SECKILL_SCRIPT;
+    static {
+        SECKILL_SCRIPT = new DefaultRedisScript<>();
+        SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
+        SECKILL_SCRIPT.setResultType(Long.class);
     }
+
+
+    @PostConstruct
+    public void preheatSeckill() {
+        List<SeckillVoucher> seckillVoucherList = seckillVoucherService.list();
+        seckillVoucherList.forEach( seckill -> {
+            if (seckill.getBeginTime().isBefore(LocalDateTime.now()) && seckill.getEndTime().isAfter(LocalDateTime.now())) {
+                String preKey = PREHEAT_KEY + seckill.getVoucherId();
+                long seconds = Duration.between(LocalDateTime.now(), seckill.getEndTime()).getSeconds();
+                stringRedisTemplate.opsForValue().set(preKey, seckill.getStock().toString(), seconds, TimeUnit.SECONDS);
+                log.info("优惠劵{}预热成功！", seckill.getVoucherId());
+            }
+        });
+        // 初始化异步处理器
+        OrderHandler orderHandler = new OrderHandler();
+        voucherUtil.ORDER_EXECUTOR.submit(orderHandler);
+    }
+
 
 
 
@@ -67,49 +80,24 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     @Override
     public Result seckillVoucher(Long voucherId) {
-        // 1.先判断是否生效
-        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
-        if (Objects.isNull(seckillVoucher)) {
-            log.warn("当前{}优惠劵不存在", voucherId);
-            return Result.fail("当前优惠劵不存在");
+        // redis单线程执行，串行执行lua命令，所以不会出现同时执行多卖情况
+        Long execute = stringRedisTemplate.execute(SECKILL_SCRIPT, Collections.emptyList(),
+                voucherId.toString(), UserHolder.getUser().getId().toString(), String.valueOf(redisIdWorker.nextId()));
+        if (!Objects.equals(execute, 0L)) {
+            return Result.fail(Objects.equals(execute, 1L) ? "优惠劵已空" : "已购买过");
         }
-        LocalDateTime now = LocalDateTime.now();
-        boolean isStart = now.isAfter(seckillVoucher.getBeginTime()) && now.isBefore(seckillVoucher.getEndTime());
-        if (!isStart) {
-            log.warn("{}秒杀活动未开启或已结束", voucherId);
-            return Result.fail("秒杀活动未开启或已结束");
-        }
-        if (seckillVoucher.getStock() < 1) {
-            log.warn("{}秒杀劵库存不足", voucherId);
-            return Result.fail("秒杀劵库存不足");
-        }
-        Long userId = UserHolder.getUser().getId();
-        String redisKey = LOCK_KEY + userId.toString();
-//        ILock lock = new AtomicLock(userId.toString(), stringRedisTemplate);
-//        boolean tryLock = lock.tryLock(10_000);
-//        RLock lock = redissonClient1.getLock(redisKey);
-//        RLock lock = redissonClient1.getLock(redisKey);
-        RLock lock1 = redissonClient1.getLock(redisKey);
-        RLock lock2 = redissonClient2.getLock(redisKey);
-        RLock lock3 = redissonClient3.getLock(redisKey);
-        RLock rLock = redissonClient1.getRedLock(lock1, lock2, lock3);
-        try {
-            // 参数说明：
-            // 1. waitTime: 10 - 等待获取锁的最长时间（10秒）
-            // 2. leaseTime: 30 - 锁的自动释放时间（30秒）
-            // 3. TimeUnit: 时间单位
-            boolean tryLock = rLock.tryLock(10, -1, TimeUnit.SECONDS);
-            if (!tryLock) {
-                return Result.fail("不能重复下单");
-            }
-            IVoucherOrderService currentProxy = (IVoucherOrderService) AopContext.currentProxy();
-            return currentProxy.doVoucherOrder(voucherId);
-        } catch (InterruptedException e) {
-            log.error("获取锁被中断");
-            throw new RuntimeException(e);
-        } finally {
-            rLock.unlock();
-        }
+        // 异步生产订单
+        VoucherOrder voucherOrder = VoucherOrder.builder()
+                .id(redisIdWorker.nextId())
+                .userId(UserHolder.getUser().getId())
+                .voucherId(voucherId)
+                .payType(1)
+                .status(1)
+                .createTime(LocalDateTime.now())
+                .updateTime(LocalDateTime.now())
+                .build();
+        voucherUtil.ORDER_TASKS.add(voucherOrder);
+        return Result.ok("订单创建成功");
     }
 
 
@@ -176,4 +164,53 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         voucherOrderMapper.recoverStock();
         return Result.ok();
     }
+
+
+
+    private class OrderHandler implements Runnable{
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    VoucherOrder take = voucherUtil.ORDER_TASKS.take();
+                    Long voucherId = take.getVoucherId();
+                    // todo
+//                    Integer orderCount = voucherOrderService.lambdaQuery()
+//                            .eq(VoucherOrder::getVoucherId, voucherId)
+//                            .eq(VoucherOrder::getUserId, UserHolder.getUser().getId())
+//                            .count();
+//                    if (orderCount > 0) {
+//                        log.warn("用户{}已抢购过该{}优惠券", UserHolder.getUser().getId(), voucherId);
+//                        return;
+//                    }
+                    //扣减库存
+                    boolean success = seckillVoucherService.lambdaUpdate()
+                            .setSql("stock = stock - 1")
+                            .eq(SeckillVoucher::getVoucherId, voucherId)
+                            .gt(SeckillVoucher::getStock, 0)
+                            .update();
+                    if (!success) {
+                        log.warn("{}秒杀劵已抢购完", voucherId);
+                        return;
+                    }
+                    save(take);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 }

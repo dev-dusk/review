@@ -31,7 +31,7 @@ public class RedisIdWorker {
     public long nextId() {
         // 获取相对秒
         long epochSecond = LocalDateTime.now().toEpochSecond(ZoneOffset.UTC);
-        log.info("epochSecond: {}", epochSecond);
+//        log.info("epochSecond: {}", epochSecond);
         long timestamp = epochSecond - BEGIN_TIMESTAMP;
 
         String postDate = LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE);

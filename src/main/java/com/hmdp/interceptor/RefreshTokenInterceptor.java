@@ -40,7 +40,7 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
         }
         stringRedisTemplate.expire(userInfoKey, RedisConstants.LOGIN_USER_TTL, TimeUnit.SECONDS);
         UserHolder.saveUser(JSONUtil.toBean(userInfo, UserDTO.class));
-        log.info("token刷新成功{}", userInfo);
+//        log.info("token刷新成功{}", userInfo);
         return true;
     }
 
