@@ -9,9 +9,7 @@ import com.hmdp.entity.RedisData;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
-import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.TryLockUtil;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
 import org.redisson.api.RedissonClient;
@@ -22,6 +20,7 @@ import org.springframework.util.CollectionUtils;
 import org.springframework.util.StringUtils;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
@@ -41,15 +40,17 @@ import static com.hmdp.utils.RedisConstants.*;
  */
 @Service
 @Slf4j
-@RequiredArgsConstructor
+//@RequiredArgsConstructor
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
-    private final StringRedisTemplate stringRedisTemplate;
-    private final RedissonClient redissonClient;
-    private final TryLockUtil tryLockUtil;
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    @Resource(name = "redissonClient1")
+    private  RedissonClient redissonClient1;
+    @Resource
+    private  TryLockUtil tryLockUtil;
     // 布隆过滤器
     private RBloomFilter<Long> shopBloomFilter;
-
 
     /**
      * 初始化布隆过滤器
@@ -57,7 +58,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @PostConstruct
     public void initRBloomFilter() {
         CompletableFuture.runAsync(() -> {
-            shopBloomFilter = redissonClient.getBloomFilter(BLOOM_FILTER_SHOP_KEY);
+            shopBloomFilter = redissonClient1.getBloomFilter(BLOOM_FILTER_SHOP_KEY);
             int totalCount = this.count();
             shopBloomFilter.tryInit(totalCount, 0.01);
 
@@ -108,7 +109,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     // 缓存击穿：互斥锁解决
     private Result queryWithMutex(Long id) {
-        String shopKey = RedisConstants.CACHE_SHOP_KEY + id;
+        String shopKey = CACHE_SHOP_KEY + id;
         String shopInfo = stringRedisTemplate.opsForValue().get(shopKey);
         if (StringUtils.hasText(shopInfo)) {
             log.info("商品缓存命中：{}", shopInfo);
@@ -117,7 +118,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
         // 获取锁并更新缓存
         log.warn("未命中商品{}缓存", id);
-        String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
+        String lockKey = LOCK_SHOP_KEY + id;
         int retries = 3;
         while (retries-- > 0) {
             if (tryLockUtil.tryLock(lockKey)) {
@@ -132,7 +133,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                     Shop shop = getById(id);
                     // 防止缓存击穿方案1：采用缓存空对象
                     if (Objects.isNull(shop)) {
-                        stringRedisTemplate.opsForValue().set(shopKey, RedisConstants.CACHE_NULL_KEY,
+                        stringRedisTemplate.opsForValue().set(shopKey, CACHE_NULL_KEY,
                                 CACHE_NULL_TTL, TimeUnit.MINUTES);
                     } else {
                         stringRedisTemplate.opsForValue().set(shopKey, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
@@ -148,7 +149,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     // 缓存击穿：逻辑过期
     private Result queryWithExpire(Long id) {
-        String shopKey = RedisConstants.CACHE_SHOP_KEY + id;
+        String shopKey = CACHE_SHOP_KEY + id;
         String shopInfo = stringRedisTemplate.opsForValue().get(shopKey);
         // 1.如果缓存未存在，查询数据库并设置逻辑过期时间
         if (!StringUtils.hasText(shopInfo)) {
@@ -176,7 +177,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
 
         // 3.逻辑已过期，先返回旧数据，再去异步更新
-        String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
+        String lockKey = LOCK_SHOP_KEY + id;
         if (tryLockUtil.tryLock(lockKey)) {
             CompletableFuture.runAsync(() -> {
                 // 双检机制
@@ -213,7 +214,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (!update) {
             return Result.fail("更新商品数据失败！");
         }
-        String shopKey = RedisConstants.CACHE_SHOP_KEY + shop.getId();
+        String shopKey = CACHE_SHOP_KEY + shop.getId();
         stringRedisTemplate.delete(shopKey);
         return Result.ok("更新商品成功");
     }
@@ -225,7 +226,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (!remove) {
             return Result.fail("删除商品数据失败");
         }
-        String shopKey = RedisConstants.CACHE_SHOP_KEY + id;
+        String shopKey = CACHE_SHOP_KEY + id;
         stringRedisTemplate.delete(shopKey);
         return Result.ok("删除商品成功");
     }
