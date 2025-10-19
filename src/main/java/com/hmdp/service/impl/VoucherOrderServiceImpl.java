@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.lock.AtomicLock;
+import com.hmdp.lock.ILock;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
@@ -12,6 +14,7 @@ import com.hmdp.utils.UserHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,6 +37,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private final VoucherOrderMapper voucherOrderMapper;
     private final ISeckillVoucherService seckillVoucherService;
     private final RedisIdWorker redisIdWorker;
+    private final StringRedisTemplate stringRedisTemplate;
 
 
     /**
@@ -58,9 +62,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail("秒杀劵库存不足");
         }
         Long userId = UserHolder.getUser().getId();
-        synchronized (userId.toString().intern()) {
+        ILock lock = new AtomicLock(userId.toString(), stringRedisTemplate);
+        boolean tryLock = lock.tryLock(10_000);
+        if (!tryLock) {
+            return Result.fail("不能重复下单");
+        }
+        try {
             IVoucherOrderService currentProxy = (IVoucherOrderService) AopContext.currentProxy();
             return currentProxy.doVoucherOrder(voucherId);
+        } finally {
+            lock.unLock();
         }
     }
 

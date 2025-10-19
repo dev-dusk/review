@@ -28,7 +28,7 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
         // 职责分离，只处理token无感刷新和用户信息获取
         String token = request.getHeader("authorization");
         if (!StringUtils.hasText(token)) {
-            token = "divrj4iv0bj8hmgnha6cps86ez143epb";
+            token = "kdttjj41czgkc3fi208yklngdw4nif63";
 //            log.warn("获取用户token失败！");
 //            return true;
         }
