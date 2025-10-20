@@ -23,4 +23,6 @@ public class RedisConstants {
 
     public static final String BLOOM_FILTER_SHOP_KEY = "bloom:shop";
 
+    public static final String STREAM_NAME  = "stream.orders";
+
 }

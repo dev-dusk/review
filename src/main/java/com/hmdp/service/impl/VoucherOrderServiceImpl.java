@@ -1,5 +1,7 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.bean.copier.CopyOptions;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
@@ -14,16 +16,19 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RedissonClient;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.CollectionUtils;
 
 import javax.annotation.PostConstruct;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
@@ -67,8 +72,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 log.info("优惠劵{}预热成功！", seckill.getVoucherId());
             }
         });
+        // 创建消费组
+//        try {
+//            stringRedisTemplate.opsForStream().createGroup("stream.orders", ReadOffset.from("0"), "order_group");
+//        } catch (Exception e) {
+//            log.info("消费组已存在");
+//        }
         // 初始化异步处理器
-        OrderHandler orderHandler = new OrderHandler();
+        Runnable orderHandler = new OrderStreamHandler();
         voucherUtil.ORDER_EXECUTOR.submit(orderHandler);
     }
 
@@ -87,16 +98,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail(Objects.equals(execute, 1L) ? "优惠劵已空" : "已购买过");
         }
         // 异步生产订单
-        VoucherOrder voucherOrder = VoucherOrder.builder()
-                .id(redisIdWorker.nextId())
-                .userId(UserHolder.getUser().getId())
-                .voucherId(voucherId)
-                .payType(1)
-                .status(1)
-                .createTime(LocalDateTime.now())
-                .updateTime(LocalDateTime.now())
-                .build();
-        voucherUtil.ORDER_TASKS.add(voucherOrder);
+//        VoucherOrder voucherOrder = VoucherOrder.builder()
+//                .id(redisIdWorker.nextId())
+//                .userId(UserHolder.getUser().getId())
+//                .voucherId(voucherId)
+//                .payType(1)
+//                .status(1)
+//                .createTime(LocalDateTime.now())
+//                .updateTime(LocalDateTime.now())
+//                .build();
+//        voucherUtil.ORDER_TASKS.add(voucherOrder);
         return Result.ok("订单创建成功");
     }
 
@@ -167,22 +178,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
 
 
-    private class OrderHandler implements Runnable{
+/*    private class OrderHandler implements Runnable{
         @Override
         public void run() {
             while (true) {
                 try {
                     VoucherOrder take = voucherUtil.ORDER_TASKS.take();
                     Long voucherId = take.getVoucherId();
-                    // todo
-//                    Integer orderCount = voucherOrderService.lambdaQuery()
-//                            .eq(VoucherOrder::getVoucherId, voucherId)
-//                            .eq(VoucherOrder::getUserId, UserHolder.getUser().getId())
-//                            .count();
-//                    if (orderCount > 0) {
-//                        log.warn("用户{}已抢购过该{}优惠券", UserHolder.getUser().getId(), voucherId);
-//                        return;
-//                    }
                     //扣减库存
                     boolean success = seckillVoucherService.lambdaUpdate()
                             .setSql("stock = stock - 1")
@@ -196,6 +198,60 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     save(take);
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
+                }
+            }
+        }
+    }*/
+
+
+    private class OrderStreamHandler implements Runnable{
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    List<MapRecord<String, Object, Object>> recordList = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("order_group", "order_consume"),
+                            // 每次取一条数据，无数据阻塞两秒
+                            StreamReadOptions.empty().count(1L).block(Duration.ofSeconds(2L)),
+                            // 每次获取最新的数据记录
+                            StreamOffset.create("stream.orders", ReadOffset.lastConsumed())
+                    );
+                    if (CollectionUtils.isEmpty(recordList)) {
+                        continue;
+                    }
+                    MapRecord<String, Object, Object> record = recordList.get(0);
+                    log.info("record:{}", record);
+                    Map<Object, Object> value = record.getValue();
+                    log.info("value:{}", value);
+                    VoucherOrder voucherOrder = VoucherOrder.builder()
+                            .id(Long.valueOf((String) value.get("orderId")))
+                            .userId(Long.valueOf((String) value.get("userId")))
+                            .voucherId(Long.valueOf((String) value.get("voucherId")))
+                            .build();
+                    // 创建订单
+                    save(voucherOrder);
+                    stringRedisTemplate.opsForStream().acknowledge("stream.orders", "order_group", record.getId());
+
+                } catch (Exception e) {
+                    log.error("处理订单异常",e);
+                    List<MapRecord<String, Object, Object>> recordList = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("order_group", "order_consume"),
+                            // 每次取一条数据，无数据阻塞两秒
+                            StreamReadOptions.empty().count(1L),
+                            // 每次获取最新的数据记录
+                            StreamOffset.create("stream.orders", ReadOffset.from("0"))
+                    );
+                    if (CollectionUtils.isEmpty(recordList)) {
+                        break;
+                    }
+                    MapRecord<String, Object, Object> record = recordList.get(0);
+                    log.info("record:{}", record);
+                    Map<Object, Object> value = record.getValue();
+                    log.info("value:{}", value);
+                    VoucherOrder voucherOrder = BeanUtil.mapToBean(value, VoucherOrder.class, true, CopyOptions.create().ignoreCase());
+                    // 创建订单
+                    save(voucherOrder);
+                    stringRedisTemplate.opsForStream().acknowledge("stream.orders", "order_group", record.getId());
                 }
             }
         }
