@@ -3,22 +3,25 @@ package com.hmdp.service.impl;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Blog;
+import com.hmdp.entity.ScrollResult;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.BlogMapper;
 import com.hmdp.service.IBlogService;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.UserHolder;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
 
 import javax.annotation.Resource;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
+import static com.hmdp.utils.RedisConstants.FEED_KEY;
 
 /**
  * <p>
@@ -29,6 +32,7 @@ import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
 
     @Resource(name = "stringRedisTemplate")
@@ -120,6 +124,44 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                 .last("order by field (id, " + idStr + ")")
                 .list();
         return Result.ok(userList);
+    }
+
+
+    @Override
+    public Result queryBlogOfFollow(Long max, Integer offset) {
+        String userId = String.valueOf(UserHolder.getUser().getId());
+        String feedKey = FEED_KEY + userId;
+        Set<ZSetOperations.TypedTuple<String>> typedTuples = template.opsForZSet()
+                .reverseRangeByScoreWithScores(feedKey, 0, max, offset, 2);
+        if (CollectionUtils.isEmpty(typedTuples)) {
+            log.info("暂无关注发布文章");
+            return Result.ok();
+        }
+        // 解析数据
+        List<String> ids = new ArrayList<>(typedTuples.size());
+        AtomicLong minTime = new AtomicLong(0L);
+        AtomicInteger offsetCount = new AtomicInteger(1);
+        typedTuples.forEach(tuple -> {
+            ids.add(tuple.getValue());
+            long score = Objects.requireNonNull(tuple.getScore()).longValue();
+            if (minTime.get() == score) {
+                offsetCount.getAndIncrement();
+            } else {
+                minTime.set(score);
+                offsetCount.set(1);
+            }
+        });
+        offsetCount.set(minTime.get() == max ? offsetCount.get() : offsetCount.addAndGet(offset));
+        String idStr = String.join(",", ids);
+        List<Blog> blogList = this.lambdaQuery()
+                .in(Blog::getId, ids)
+                .last("order by FIELD (id," + idStr + ")")
+                .list();
+        ScrollResult scrollResult = new ScrollResult();
+        scrollResult.setList(blogList);
+        scrollResult.setMinTime(minTime.get());
+        scrollResult.setOffset(offsetCount.get());
+        return Result.ok(scrollResult);
     }
 
 

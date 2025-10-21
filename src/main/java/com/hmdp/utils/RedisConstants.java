@@ -25,4 +25,7 @@ public class RedisConstants {
 
     public static final String STREAM_NAME  = "stream.orders";
 
+    public static final String FOLLOW_KEY = "follow:user:";
+
+
 }
