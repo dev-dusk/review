@@ -9,10 +9,15 @@ import com.hmdp.entity.RedisData;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
+import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.TryLockUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
 import org.redisson.api.RedissonClient;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.GeoResults;
+import org.springframework.data.geo.Point;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,8 +27,7 @@ import org.springframework.util.StringUtils;
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -230,4 +234,73 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         stringRedisTemplate.delete(shopKey);
         return Result.ok("删除商品成功");
     }
+
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, String x, String y) {
+        // 根据类型分页查询
+//        Page<Shop> page = query()
+//                .eq("type_id", typeId)
+//                .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+//        if (CollectionUtils.isEmpty(page.getRecords())) {
+//            log.info("查询店铺数据为空");
+//            return Result.ok(Collections.emptyList());
+//        }
+        int pageStart = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        int pageEnd = current * SystemConstants.DEFAULT_PAGE_SIZE;
+        String geoKey = SHOP_GEO_KEY + typeId;
+        // 使用 radius 方法替代 search 方法，避免 StackOverflowError
+        GeoResults<RedisGeoCommands.GeoLocation<String>> geoSearch = stringRedisTemplate.opsForGeo().radius(geoKey,
+                // 使用 Circle 对象定义圆形区域：中心点 + 半径
+                new org.springframework.data.geo.Circle(
+                        new Point(Double.parseDouble(x), Double.parseDouble(y)),
+                        new Distance(5000, RedisGeoCommands.DistanceUnit.METERS)
+                ),
+                // 包含距离和坐标信息，并限制数量
+                RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                        .includeDistance()
+                        .sortAscending()
+                        .limit(pageEnd));
+        if (Objects.isNull(geoSearch)) {
+            log.info("查询店铺数据为空");
+            return Result.ok(Collections.emptyList());
+        }
+        Map<String, Double> distanceMap = new HashMap<>();
+        // 跳过pageStart前面的数据
+        geoSearch.getContent().stream().skip(pageStart).forEach(result -> {
+            distanceMap.put(result.getContent().getName(), result.getDistance().getValue());
+        });
+        if (distanceMap.isEmpty()) {
+            log.info("查询店铺数据为空");
+            return Result.ok(Collections.emptyList());
+        }
+        List<Shop> shopList = this.lambdaQuery()
+                .in(Shop::getId, distanceMap.keySet())
+                .last("order by FIELD(id," + String.join(",", distanceMap.keySet()) + ")")
+                .list();
+        shopList.forEach(shopItem -> shopItem.setDistance(distanceMap.get(String.valueOf(shopItem.getId()))));
+        // 返回数据
+        return Result.ok(shopList);
+    }
+
+
+
+    @PostConstruct
+    public void initGeo() {
+        List<Shop> shopList = list();
+        if (CollectionUtils.isEmpty(shopList)) {
+            return;
+        }
+        Map<Long, List<Shop>> typeMap = shopList.stream().collect(Collectors.groupingBy(Shop::getTypeId));
+        typeMap.forEach((key, value) -> {
+            String geoKey = SHOP_GEO_KEY + key;
+            List<RedisGeoCommands.GeoLocation<String>> geoLocationList = value.stream().map(shopItem -> {
+                Point point = new Point(shopItem.getX(), shopItem.getY());
+                return new RedisGeoCommands.GeoLocation<>(String.valueOf(shopItem.getId()), point);
+            }).collect(Collectors.toList());
+            stringRedisTemplate.opsForGeo().add(geoKey, geoLocationList);
+        });
+        log.info("初始化GEO商铺位置完成");
+    }
+
 }

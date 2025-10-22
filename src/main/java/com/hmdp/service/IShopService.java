@@ -19,4 +19,6 @@ public interface IShopService extends IService<Shop> {
     Result updateShop(Shop shop);
 
     Result deleteShop(String id);
+
+    Result queryShopByType(Integer typeId, Integer current, String x, String y);
 }
